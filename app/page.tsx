@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 interface Journal {
   title: string;
@@ -81,6 +81,15 @@ export default function TopJournalQuery() {
   const [detailWork, setDetailWork] = useState<OpenAlexWork | null>(null);
   const [selectedWorksMap, setSelectedWorksMap] = useState<Record<string, OpenAlexWork>>({});
   const [selectAllLoading, setSelectAllLoading] = useState(false);
+  const [selectAllCountdown, setSelectAllCountdown] = useState(0);
+  const selectAllAbortRef = useRef<AbortController | null>(null);
+  const [exportMenuOpen, setExportMenuOpen] = useState(false);
+  const [exportPageStart, setExportPageStart] = useState("1");
+  const [exportPageEnd, setExportPageEnd] = useState("1");
+  const [exportLoading, setExportLoading] = useState(false);
+  const [exportError, setExportError] = useState("");
+  const [exportCountdown, setExportCountdown] = useState(0);
+  const exportAbortRef = useRef<AbortController | null>(null);
 
   const translations = {
     en: {
@@ -116,10 +125,23 @@ export default function TopJournalQuery() {
       resultsCount: "Results",
       selectedCount: "Selected",
       exportRis: "Export RIS",
+      exportSelected: "Export Selected",
+      exportCurrentPage: "Export This Page",
+      exportPageRange: "Export Page Range",
+      exportRangeFrom: "From",
+      exportRangeTo: "To",
+      exportRangeLimit: "Max per export: 2000 results (up to {pages} pages).",
+      exportRangeError: "Invalid page range.",
+      exporting: "Exporting...",
+      exportCountdownLabel: "Estimated time left",
+      exportLimitTip: "Each export is capped at 2000 results. Export remaining pages separately.",
+      exportTotalPages: "Total pages: {pages}",
       selectPage: "Select Page",
       selectAllResults: "Select All Results",
       clearSelection: "Clear Selection",
       selectingAll: "Selecting...",
+      selectAllCountdownLabel: "Estimated time left",
+      cancelSelectAll: "Cancel",
       selectAllLimit: "Select all is capped at 2000 results (OpenAlex limit).",
       noResults: "No results found. Adjust your filters or keywords.",
       journalPreview: "Matched Journals Preview",
@@ -177,10 +199,23 @@ export default function TopJournalQuery() {
       resultsCount: "结果数",
       selectedCount: "已选择",
       exportRis: "导出 RIS",
+      exportSelected: "导出所选",
+      exportCurrentPage: "导出此页",
+      exportPageRange: "导出页码范围",
+      exportRangeFrom: "起始",
+      exportRangeTo: "结束",
+      exportRangeLimit: "每次最多 2000 篇（最多 {pages} 页）。",
+      exportRangeError: "页码范围不合法。",
+      exporting: "正在导出...",
+      exportCountdownLabel: "预计剩余时间",
+      exportLimitTip: "每次最多 2000 篇，请分批导出剩余页数。",
+      exportTotalPages: "总页数：{pages}",
       selectPage: "全选本页",
       selectAllResults: "全选全部",
       clearSelection: "取消全选",
       selectingAll: "正在全选...",
+      selectAllCountdownLabel: "预计剩余时间",
+      cancelSelectAll: "取消全选",
       selectAllLimit: "全选最多 2000 篇（OpenAlex 限制）。",
       noResults: "未找到结果，请调整条件。",
       journalPreview: "匹配期刊预览",
@@ -282,6 +317,7 @@ export default function TopJournalQuery() {
   }, [filteredJournals]);
 
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const maxExportPages = Math.max(1, Math.floor(2000 / pageSize));
 
   const getAuthorsText = (work: OpenAlexWork) => {
     const authors =
@@ -340,19 +376,101 @@ export default function TopJournalQuery() {
     return lines.join("\n");
   };
 
-  const exportSelectedRis = () => {
-    const selectedWorks = selectedWorkIds
-      .map((id) => selectedWorksMap[id])
-      .filter(Boolean);
-    if (selectedWorks.length === 0) return;
-    const risContent = selectedWorks.map(workToRis).join("\n\n");
+  const exportWorksToRis = (list: OpenAlexWork[], filename: string) => {
+    if (list.length === 0) return;
+    const risContent = list.map(workToRis).join("\n\n");
     const blob = new Blob([risContent], { type: "application/x-research-info-systems" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "openalex_results.ris";
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const exportSelectedRis = () => {
+    const selectedWorks = selectedWorkIds
+      .map((id) => selectedWorksMap[id])
+      .filter(Boolean);
+    exportWorksToRis(selectedWorks, "openalex_selected.ris");
+  };
+
+  const exportCurrentPage = () => {
+    exportWorksToRis(works, `openalex_page_${currentPage}.ris`);
+  };
+
+  const exportPageRange = async () => {
+    const start = Number(exportPageStart);
+    const end = Number(exportPageEnd);
+    if (!start || !end || start < 1 || end < start || end > totalPages) {
+      setExportError(t.exportRangeError);
+      return;
+    }
+    if (end - start + 1 > maxExportPages) {
+      setExportError(t.exportRangeError);
+      return;
+    }
+    setExportError("");
+    setExportLoading(true);
+    setExportCountdown(0);
+    exportAbortRef.current?.abort();
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
+    let countdownTimer: number | null = null;
+    try {
+      const allWorks: OpenAlexWork[] = [];
+      const perPageExport = 200;
+      const startIndex = (start - 1) * pageSize;
+      const endIndex = Math.min(end * pageSize, totalCount);
+      const startPage = Math.floor(startIndex / perPageExport) + 1;
+      const endPage = Math.ceil(endIndex / perPageExport);
+      const totalPagesToFetch = endPage - startPage + 1;
+      const totalToFetch = endIndex - startIndex;
+      const estimatedSeconds = Math.max(
+        1,
+        Math.min(40, Math.ceil((totalToFetch * 40) / 2000))
+      );
+      setExportCountdown(estimatedSeconds);
+      countdownTimer = window.setInterval(() => {
+        setExportCountdown((prev) => (prev > 0 ? prev - 1 : 0));
+      }, 1000);
+      for (let page = startPage; page <= endPage; page += 1) {
+        const url = buildSearchUrl(page).replace(
+          `per_page=${pageSize}`,
+          `per_page=${perPageExport}`
+        );
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok) {
+          throw new Error(`OpenAlex error: ${res.status}`);
+        }
+        const data = await res.json();
+        const results = data.results || [];
+        allWorks.push(...results);
+      }
+      const sliceOffset = startIndex - (startPage - 1) * perPageExport;
+      const sliceCount = endIndex - startIndex;
+      const exportSlice = allWorks.slice(sliceOffset, sliceOffset + sliceCount);
+      exportWorksToRis(exportSlice, `openalex_pages_${start}-${end}.ris`);
+      setExportMenuOpen(false);
+    } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        setExportError(String(error));
+      }
+      console.error(error);
+    } finally {
+      if (countdownTimer !== null) {
+        window.clearInterval(countdownTimer);
+      }
+      exportAbortRef.current = null;
+      setExportCountdown(0);
+      setExportLoading(false);
+    }
+  };
+
+  const cancelExport = () => {
+    exportAbortRef.current?.abort();
+    setExportLoading(false);
+    setExportCountdown(0);
   };
 
   const handleSaveKey = () => {
@@ -462,18 +580,27 @@ export default function TopJournalQuery() {
   const selectAllResults = async () => {
     if (!hasSearched) return;
     setSelectAllLoading(true);
+    setSearchError("");
     try {
       const maxResults = 2000;
       const totalToFetch = Math.min(totalCount, maxResults);
       const perPage = 200;
       const totalPagesToFetch = Math.ceil(totalToFetch / perPage);
+      const estimatedSeconds = Math.max(1, Math.min(40, Math.ceil((totalToFetch * 40) / 2000)));
+      setSelectAllCountdown(estimatedSeconds);
+      selectAllAbortRef.current?.abort();
+      const controller = new AbortController();
+      selectAllAbortRef.current = controller;
+      const countdownTimer = window.setInterval(() => {
+        setSelectAllCountdown((prev) => (prev > 0 ? prev - 1 : 0));
+      }, 1000);
       const allWorks: OpenAlexWork[] = [];
       for (let page = 1; page <= totalPagesToFetch; page += 1) {
         const url = buildSearchUrl(page).replace(
           `per_page=${pageSize}`,
           `per_page=${perPage}`
         );
-        const res = await fetch(url);
+        const res = await fetch(url, { signal: controller.signal });
         if (!res.ok) {
           throw new Error(`OpenAlex error: ${res.status}`);
         }
@@ -481,6 +608,7 @@ export default function TopJournalQuery() {
         const results = data.results || [];
         allWorks.push(...results);
       }
+      window.clearInterval(countdownTimer);
       const map: Record<string, OpenAlexWork> = {};
       allWorks.forEach((work) => {
         map[work.id] = work;
@@ -488,11 +616,21 @@ export default function TopJournalQuery() {
       setSelectedWorksMap(map);
       setSelectedWorkIds(allWorks.map((w) => w.id));
     } catch (error) {
+      if ((error as Error).name !== "AbortError") {
+        setSearchError(String(error));
+      }
       console.error(error);
-      setSearchError(String(error));
     } finally {
+      selectAllAbortRef.current = null;
+      setSelectAllCountdown(0);
       setSelectAllLoading(false);
     }
+  };
+
+  const cancelSelectAll = () => {
+    selectAllAbortRef.current?.abort();
+    setSelectAllLoading(false);
+    setSelectAllCountdown(0);
   };
 
   const clearSelection = () => {
@@ -833,26 +971,78 @@ export default function TopJournalQuery() {
                   >
                     {t.selectAllResults}
                   </button>
-                  {totalCount > 2000 && (
-                    <span
-                      title={t.selectAllLimit}
-                      className="inline-flex items-center justify-center w-6 h-6 rounded-full border border-gray-300 text-gray-500 text-xs"
-                    >
-                      i
-                    </span>
-                  )}
                   <button
                     onClick={clearSelection}
                     className="px-3 py-1.5 rounded-md border text-gray-700 hover:bg-gray-50 transition"
                   >
                     {t.clearSelection}
                   </button>
-                  <button
-                    onClick={exportSelectedRis}
-                    className="px-3 py-1.5 rounded-md border text-gray-700 hover:bg-gray-50 transition"
-                  >
-                    {t.exportRis}
-                  </button>
+                  <div className="relative">
+                    <button
+                      onClick={() => setExportMenuOpen((prev) => !prev)}
+                      className="px-3 py-1.5 rounded-md border text-gray-700 hover:bg-gray-50 transition"
+                    >
+                      {t.exportRis}
+                    </button>
+                    {exportMenuOpen && (
+                      <div className="absolute right-0 mt-2 w-56 bg-white border border-gray-200 rounded-lg shadow-lg p-3 z-20">
+                        <div className="flex flex-col gap-2">
+                          <button
+                            onClick={() => {
+                              exportSelectedRis();
+                              setExportMenuOpen(false);
+                            }}
+                            className="text-left text-sm text-gray-700 hover:text-gray-900"
+                          >
+                            {t.exportSelected}
+                          </button>
+                          <button
+                            onClick={() => {
+                              exportCurrentPage();
+                              setExportMenuOpen(false);
+                            }}
+                            className="text-left text-sm text-gray-700 hover:text-gray-900"
+                          >
+                            {t.exportCurrentPage}
+                          </button>
+                          <div className="pt-2 border-t text-xs text-gray-500">
+                            {t.exportPageRange}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <input
+                              className="w-16 px-2 py-1 border border-gray-300 rounded-md text-sm"
+                              value={exportPageStart}
+                              onChange={(e) => setExportPageStart(e.target.value)}
+                              placeholder={t.exportRangeFrom}
+                            />
+                            <span className="text-xs text-gray-500">-</span>
+                            <input
+                              className="w-16 px-2 py-1 border border-gray-300 rounded-md text-sm"
+                              value={exportPageEnd}
+                              onChange={(e) => setExportPageEnd(e.target.value)}
+                              placeholder={t.exportRangeTo}
+                            />
+                            <button
+                              onClick={exportPageRange}
+                              className="px-2 py-1 rounded-md border text-gray-700 hover:bg-gray-50 text-xs"
+                              disabled={exportLoading}
+                            >
+                              {exportLoading ? t.searching : t.exportRis}
+                            </button>
+                          </div>
+                          <div className="text-[11px] text-gray-500">
+                            {t.exportRangeLimit.replace("{pages}", String(maxExportPages))}
+                          </div>
+                          <div className="text-[11px] text-gray-500">
+                            {t.exportTotalPages.replace("{pages}", String(totalPages))}
+                          </div>
+                          {exportError && (
+                            <div className="text-xs text-red-600">{exportError}</div>
+                          )}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
               <div className="flex-1 overflow-auto border border-gray-200 rounded-lg shadow-sm">
@@ -950,7 +1140,46 @@ export default function TopJournalQuery() {
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
           <div className="bg-white rounded-xl shadow-xl px-6 py-4 flex items-center gap-3">
             <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-            <span className="text-sm text-gray-700">{t.selectingAll}</span>
+            <div className="flex flex-col gap-1">
+              <span className="text-sm text-gray-700">{t.selectingAll}</span>
+              {selectAllCountdown > 0 && (
+                <span className="text-xs text-gray-500">
+                  {t.selectAllCountdownLabel}: {selectAllCountdown}s
+                </span>
+              )}
+              {totalCount > 2000 && (
+                <span className="text-xs text-gray-500">{t.selectAllLimit}</span>
+              )}
+            </div>
+            <button
+              onClick={cancelSelectAll}
+              className="ml-4 px-3 py-1.5 rounded-md border text-gray-700 hover:bg-gray-50 transition"
+            >
+              {t.cancelSelectAll}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {exportLoading && (
+        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl px-6 py-4 flex items-center gap-3">
+            <div className="w-5 h-5 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+            <div className="flex flex-col gap-1">
+              <span className="text-sm text-gray-700">{t.exporting}</span>
+              {exportCountdown > 0 && (
+                <span className="text-xs text-gray-500">
+                  {t.exportCountdownLabel}: {exportCountdown}s
+                </span>
+              )}
+              <span className="text-xs text-gray-500">{t.exportLimitTip}</span>
+            </div>
+            <button
+              onClick={cancelExport}
+              className="ml-4 px-3 py-1.5 rounded-md border text-gray-700 hover:bg-gray-50 transition"
+            >
+              {t.cancelSelectAll}
+            </button>
           </div>
         </div>
       )}
