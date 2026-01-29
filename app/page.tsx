@@ -121,8 +121,6 @@ export default function TopJournalQuery() {
       clearSelection: "Clear Selection",
       selectingAll: "Selecting...",
       selectAllLimit: "Select all is capped at 2000 results (OpenAlex limit).",
-      selectAll: "Select All",
-      selectAllResults: "Select All Results",
       noResults: "No results found. Adjust your filters or keywords.",
       journalPreview: "Matched Journals Preview",
       columnTitle: "Title",
