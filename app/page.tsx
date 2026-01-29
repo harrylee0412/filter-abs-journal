@@ -71,8 +71,10 @@ export default function TopJournalQuery() {
   // Results
   const [works, setWorks] = useState<OpenAlexWork[]>([]);
   const [totalCount, setTotalCount] = useState(0);
+  const [rawTotalCount, setRawTotalCount] = useState(0);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
+  const [filteredOutCount, setFilteredOutCount] = useState(0);
 
   // UI States
   const [currentPage, setCurrentPage] = useState(1);
@@ -123,6 +125,10 @@ export default function TopJournalQuery() {
       searching: "Searching...",
       resultsTitle: "Search Results",
       resultsCount: "Results",
+      filteredOut: "Filtered",
+      filteredOutSuffix: "filtered for this selection",
+      filteredOutTip:
+        "OpenAlex may return records with missing titles or editorial-only entries. Filtered for this selection.",
       selectedCount: "Selected",
       exportRis: "Export RIS",
       exportSelected: "Export Selected",
@@ -197,6 +203,9 @@ export default function TopJournalQuery() {
       searching: "搜索中...",
       resultsTitle: "检索结果",
       resultsCount: "结果数",
+      filteredOut: "已过滤",
+      filteredOutSuffix: "本次选择已过滤异常记录",
+      filteredOutTip: "OpenAlex 数据源可能包含标题缺失或编委信息等异常记录。本次选择已过滤异常记录。",
       selectedCount: "已选择",
       exportRis: "导出 RIS",
       exportSelected: "导出所选",
@@ -316,7 +325,7 @@ export default function TopJournalQuery() {
     );
   }, [filteredJournals]);
 
-  const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const totalPages = Math.max(1, Math.ceil(rawTotalCount / pageSize));
   const maxExportPages = Math.max(1, Math.floor(2000 / pageSize));
 
   const getAuthorsText = (work: OpenAlexWork) => {
@@ -330,6 +339,25 @@ export default function TopJournalQuery() {
 
   const getJournalText = (work: OpenAlexWork) => {
     return work.primary_location?.source?.display_name || t.unknown;
+  };
+
+  const normalizeText = (value: string) =>
+    value.trim().toLowerCase().replace(/[.]+$/g, "");
+
+  const isValidTitle = (title?: string) => {
+    if (!title) return false;
+    const normalized = normalizeText(title);
+    if (!normalized) return false;
+    if (normalized === "editorial board") return false;
+    if (normalized === "unknown" || normalized === "未知") return false;
+    return true;
+  };
+
+  const shouldDisplayWork = (work: OpenAlexWork) => {
+    if (!isValidTitle(work.display_name)) return false;
+    const journal = work.primary_location?.source?.display_name;
+    if (!journal) return true;
+    return normalizeText(work.display_name) !== normalizeText(journal);
   };
 
   const reconstructAbstract = (index?: Record<string, number[]>) => {
@@ -421,7 +449,7 @@ export default function TopJournalQuery() {
       const allWorks: OpenAlexWork[] = [];
       const perPageExport = 200;
       const startIndex = (start - 1) * pageSize;
-      const endIndex = Math.min(end * pageSize, totalCount);
+      const endIndex = Math.min(end * pageSize, rawTotalCount);
       const startPage = Math.floor(startIndex / perPageExport) + 1;
       const endPage = Math.ceil(endIndex / perPageExport);
       const totalPagesToFetch = endPage - startPage + 1;
@@ -449,7 +477,9 @@ export default function TopJournalQuery() {
       }
       const sliceOffset = startIndex - (startPage - 1) * perPageExport;
       const sliceCount = endIndex - startIndex;
-      const exportSlice = allWorks.slice(sliceOffset, sliceOffset + sliceCount);
+      const exportSlice = allWorks
+        .slice(sliceOffset, sliceOffset + sliceCount)
+        .filter((work) => shouldDisplayWork(work));
       exportWorksToRis(exportSlice, `openalex_pages_${start}-${end}.ris`);
       setExportMenuOpen(false);
     } catch (error) {
@@ -518,19 +548,24 @@ export default function TopJournalQuery() {
       }
       const data = await res.json();
       const results = data.results || [];
-      setWorks(results);
+      const filteredResults = results.filter((work: OpenAlexWork) =>
+        shouldDisplayWork(work)
+      );
+      setWorks(filteredResults);
+      setFilteredOutCount(0);
+      setRawTotalCount(data.meta?.count || 0);
       setTotalCount(data.meta?.count || 0);
       // Keep selections across pages; only reset on a new search.
       if (resetCache) {
         const map: Record<string, OpenAlexWork> = {};
-        results.forEach((work: OpenAlexWork) => {
+        filteredResults.forEach((work: OpenAlexWork) => {
           map[work.id] = work;
         });
         setSelectedWorksMap(map);
       } else {
         setSelectedWorksMap((prev) => {
           const next = { ...prev };
-          results.forEach((work: OpenAlexWork) => {
+          filteredResults.forEach((work: OpenAlexWork) => {
             next[work.id] = work;
           });
           return next;
@@ -541,6 +576,8 @@ export default function TopJournalQuery() {
       setSearchError(String(error));
       setWorks([]);
       setTotalCount(0);
+      setRawTotalCount(0);
+      setFilteredOutCount(0);
     } finally {
       setSearchLoading(false);
     }
@@ -551,6 +588,8 @@ export default function TopJournalQuery() {
       setSearchError(t.noResults);
       setWorks([]);
       setTotalCount(0);
+      setRawTotalCount(0);
+      setFilteredOutCount(0);
       setSelectedWorkIds([]);
       return;
     }
@@ -572,9 +611,11 @@ export default function TopJournalQuery() {
     searchOpenAlex(1, true);
   }, [sortBy, pageSize]);
 
+
   const selectCurrentPage = () => {
     const ids = works.map((w) => w.id);
     setSelectedWorkIds(ids);
+    setFilteredOutCount(0);
   };
 
   const selectAllResults = async () => {
@@ -583,7 +624,7 @@ export default function TopJournalQuery() {
     setSearchError("");
     try {
       const maxResults = 2000;
-      const totalToFetch = Math.min(totalCount, maxResults);
+      const totalToFetch = Math.min(rawTotalCount, maxResults);
       const perPage = 200;
       const totalPagesToFetch = Math.ceil(totalToFetch / perPage);
       const estimatedSeconds = Math.max(1, Math.min(40, Math.ceil((totalToFetch * 40) / 2000)));
@@ -606,7 +647,10 @@ export default function TopJournalQuery() {
         }
         const data = await res.json();
         const results = data.results || [];
-        allWorks.push(...results);
+        const filteredResults = results.filter((work: OpenAlexWork) =>
+          shouldDisplayWork(work)
+        );
+        allWorks.push(...filteredResults);
       }
       window.clearInterval(countdownTimer);
       const map: Record<string, OpenAlexWork> = {};
@@ -615,6 +659,7 @@ export default function TopJournalQuery() {
       });
       setSelectedWorksMap(map);
       setSelectedWorkIds(allWorks.map((w) => w.id));
+      setFilteredOutCount(Math.max(0, totalToFetch - allWorks.length));
     } catch (error) {
       if ((error as Error).name !== "AbortError") {
         setSearchError(String(error));
@@ -957,6 +1002,16 @@ export default function TopJournalQuery() {
                     <strong className="text-gray-900">
                       {selectedWorkIds.length}
                     </strong>
+                  </span>
+                  <span className="flex items-center gap-1">
+                    {t.filteredOut}:{" "}
+                    <strong className="text-gray-900">{filteredOutCount}</strong>
+                    <span
+                      title={t.filteredOutTip}
+                      className="inline-flex items-center justify-center w-5 h-5 rounded-full border border-gray-300 text-gray-500 text-[10px]"
+                    >
+                      i
+                    </span>
                   </span>
                   <button
                     onClick={selectCurrentPage}
